@@ -1,0 +1,22 @@
+[package]
+name = "openssl-rehash"
+version = "0.0.1-dev"
+authors = ["Aaron Enberg <aaronenberg@gmail.com>"]
+edition = "2021"
+readme = "README.md"
+repository = "https://github.com/aaronenberg/openssl-rehash/"
+license = "MIT OR Apache-2.0"
+keywords = ["openssl"]
+categories = ["filesystem", "cryptography"]
+description = """
+A tool for rehashing an OpenSSL hash directory
+"""
+
+[dependencies]
+openssl = { version = "0.10.48", features = ["vendored"] }
+regex = "1.7.3"
+log = "0.4.17"
+
+[dev-dependencies]
+insta = "1.29.0"
+tempfile = "3.4.0"

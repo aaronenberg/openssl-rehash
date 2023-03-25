@@ -1,0 +1,10 @@
+---
+source: src/lib.rs
+expression: "&dir_entries"
+---
+[
+    "ca-certificates.crt",
+    "cert-link_0.crt",
+    "cert-link_1.crt",
+    "deca7eb3.0",
+]
