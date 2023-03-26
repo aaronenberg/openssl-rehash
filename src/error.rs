@@ -1,9 +1,11 @@
+/// A [`Result`] alias where the [`Err`] case is [`openssl_rehash::Error`](crate::Error)
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The Errors that may occur when rehashing a directory
 #[derive(Debug)]
 pub enum Error {
-    OpenSsl(openssl::error::ErrorStack),
     Io(std::io::Error),
+    OpenSsl(openssl::error::ErrorStack),
 }
 
 impl std::error::Error for Error {

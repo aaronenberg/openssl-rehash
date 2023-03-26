@@ -2,9 +2,8 @@ pub use crate::error::{Error, Result};
 
 use std::collections::HashSet;
 use std::fs;
-use std::io;
 use std::os::unix;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use log::warn;
 use openssl::hash::MessageDigest;
@@ -13,28 +12,27 @@ use regex::Regex;
 
 mod error;
 
-/// Rehashes a directory.
+/// Rehashes a directory
 ///
 /// Removes hash symlinks and broken symlinks (unlike openssl rehash) in
 /// the directory, then for each certificate (or symlink to a certificate) in
 /// the directory, creates a SHA1 hash symlink with a relative path to the
 /// certificate.
 ///
-/// Returns an error if any I/O operation or filesystem access fails.
+/// Returns an error if there are any I/O failures due to filesystem access or
+/// certificate deserialization
 ///
 /// NOTE: CRL hash symlinks are not yet supported
+///
+/// # Examples
+///
+/// ```no_run
+/// openssl_rehash::rehash("/etc/ssl/certs").unwrap();
+/// ```
 pub fn rehash(dir: impl AsRef<Path>) -> Result<()> {
-    clean_links(dir.as_ref())?;
-
     let mut seen_fingerprints: HashSet<Vec<u8>> = HashSet::new();
 
-    let mut entries = fs::read_dir(dir.as_ref())?
-        .map(|res| res.map(|e| e.path()))
-        .collect::<std::result::Result<Vec<_>, io::Error>>()?;
-
-    entries.sort();
-
-    for entry in entries {
+    for entry in clean_dir(dir.as_ref())? {
         if let Ok(Some(certificate)) = read_single_certificate(&entry) {
             let fingerprint = certificate.digest(MessageDigest::sha1())?;
 
@@ -54,8 +52,9 @@ pub fn rehash(dir: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-/// Removes broken and hash symlinks from the directory
-fn clean_links(dir: impl AsRef<Path>) -> Result<()> {
+/// Returns the directory's entries after any broken or hash symlinks are removed
+fn clean_dir(dir: impl AsRef<Path>) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = vec![];
     let regex = Regex::new(r"^[[:xdigit:]]{8}\.\d+$").unwrap();
 
     for entry in fs::read_dir(dir.as_ref())? {
@@ -66,11 +65,17 @@ fn clean_links(dir: impl AsRef<Path>) -> Result<()> {
                 fs::remove_file(&path)?;
             } else if regex.is_match(&entry.file_name().to_string_lossy()) {
                 fs::remove_file(&path)?;
+            } else {
+                entries.push(path);
             }
+        } else {
+            entries.push(path);
         }
     }
 
-    Ok(())
+    entries.sort();
+
+    Ok(entries)
 }
 
 fn read_single_certificate(path: impl AsRef<Path>) -> Result<Option<X509>> {
@@ -88,15 +93,13 @@ fn read_single_certificate(path: impl AsRef<Path>) -> Result<Option<X509>> {
 /// If a symlink with the same name already exists but points to a different
 /// target, then the count on the file extension is incremented.
 fn hash_link(target_path: impl AsRef<Path>, hash: u32) -> Result<()> {
-    let mut count = 0;
     let target_path = target_path.as_ref();
-    let parent_target_path = target_path.parent().unwrap();
-    let link_name = hash_link_stem(hash);
+    let parent_dir = target_path.parent().unwrap();
+    let link_name = parent_dir.join(hash_link_stem(hash));
+    let mut count = 0;
 
     loop {
-        let link_path = parent_target_path
-            .join(link_name.as_str())
-            .with_extension(format!("{count}"));
+        let link_path = link_name.with_extension(format!("{count}"));
 
         if link_path.is_symlink() {
             if link_path.try_exists()? {
@@ -142,14 +145,58 @@ mod test {
 
     use super::*;
 
+    /// tests rehash hashes a cert directory correctly
+    ///
+    /// The directory originally contains a cert bundle and two cert links
+    /// pointing to the same physical cert
+    ///
+    /// The result hash directory should contain the exact same entries and a
+    /// hash link pointing to the first cert link
+    #[test]
+    fn test_rehash() {
+        let cert = build_x509("foo");
+        let hash = format!("{:x}", cert.subject_name_hash());
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(&cert.to_pem().unwrap()).unwrap();
+        let temp_dir = tempdir().unwrap();
+        let cert_dir = temp_dir.path().to_owned();
+        let hash_link = cert_dir.join(hash).with_extension("0");
+        let cert_link_0 = cert_dir.join("cert-link_0.crt");
+        unix::fs::symlink(cert_file.path(), &cert_link_0).unwrap();
+        let cert_link_1 = cert_dir.join("cert-link_1.crt");
+        unix::fs::symlink(cert_file.path(), cert_link_1).unwrap();
+        let mut cert_bundle = File::create(cert_dir.join("ca-certificates.crt")).unwrap();
+        cert_bundle
+            .write_all(&build_x509("bar").to_pem().unwrap())
+            .unwrap();
+        cert_bundle
+            .write_all(&build_x509("baz").to_pem().unwrap())
+            .unwrap();
+
+        rehash(&cert_dir).unwrap();
+
+        let mut dir_entries: Vec<String> = vec![];
+        for entry in fs::read_dir(&cert_dir).unwrap() {
+            let entry = entry.unwrap();
+            dir_entries.push(entry.file_name().to_string_lossy().into());
+        }
+        dir_entries.sort();
+        assert_debug_snapshot!(&dir_entries);
+
+        assert_eq!(
+            hash_link.read_link().unwrap(),
+            Path::new(cert_link_0.file_name().unwrap())
+        );
+    }
+
     #[test]
     fn test_clean_links_on_empty_dir() {
         let tempdir = tempdir().unwrap();
         let cert_dir = tempdir.path().to_owned();
 
-        let result = clean_links(cert_dir);
+        let result = clean_dir(cert_dir).unwrap();
 
-        assert!(result.is_ok());
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -168,7 +215,7 @@ mod test {
         unix::fs::symlink(&cert_link_0, &hash_link_0).unwrap();
         unix::fs::symlink(&cert_link_1, &hash_link_1).unwrap();
 
-        clean_links(cert_dir).unwrap();
+        clean_dir(cert_dir).unwrap();
 
         assert!(!hash_link_0.exists() && !hash_link_1.exists());
     }
@@ -187,7 +234,7 @@ mod test {
         // break the links
         fs::remove_file(cert_file.path()).unwrap();
 
-        clean_links(cert_dir).unwrap();
+        clean_dir(cert_dir).unwrap();
 
         assert!(!broken_link_0.exists() && !broken_link_1.exists());
     }
@@ -201,7 +248,7 @@ mod test {
         let cert_link = cert_dir.join("cert-link.crt");
         unix::fs::symlink(temp_file.path(), &cert_link).unwrap();
 
-        clean_links(cert_dir).unwrap();
+        clean_dir(cert_dir).unwrap();
 
         assert!(cert_link.exists());
     }
@@ -271,50 +318,6 @@ mod test {
         assert_eq!(
             hash_link_1.read_link().unwrap(),
             Path::new(cert_link_1.file_name().unwrap())
-        );
-    }
-
-    /// tests rehash hashes a cert directory correctly
-    ///
-    /// The directory originally contains a cert bundle and two cert links
-    /// pointing to the same physical cert
-    ///
-    /// The result hash directory should contain the exact same entries and a
-    /// hash link pointing to the first cert link
-    #[test]
-    fn test_rehash() {
-        let cert = build_x509("foo");
-        let hash = format!("{:x}", cert.subject_name_hash());
-        let mut cert_file = NamedTempFile::new().unwrap();
-        cert_file.write_all(&cert.to_pem().unwrap()).unwrap();
-        let temp_dir = tempdir().unwrap();
-        let cert_dir = temp_dir.path().to_owned();
-        let hash_link = cert_dir.join(hash).with_extension("0");
-        let cert_link_0 = cert_dir.join("cert-link_0.crt");
-        unix::fs::symlink(cert_file.path(), &cert_link_0).unwrap();
-        let cert_link_1 = cert_dir.join("cert-link_1.crt");
-        unix::fs::symlink(cert_file.path(), cert_link_1).unwrap();
-        let mut cert_bundle = File::create(cert_dir.join("ca-certificates.crt")).unwrap();
-        cert_bundle
-            .write_all(&build_x509("bar").to_pem().unwrap())
-            .unwrap();
-        cert_bundle
-            .write_all(&build_x509("baz").to_pem().unwrap())
-            .unwrap();
-
-        rehash(&cert_dir).unwrap();
-
-        let mut dir_entries: Vec<String> = vec![];
-        for entry in fs::read_dir(&cert_dir).unwrap() {
-            let entry = entry.unwrap();
-            dir_entries.push(entry.file_name().to_string_lossy().into());
-        }
-        dir_entries.sort();
-        assert_debug_snapshot!(&dir_entries);
-
-        assert_eq!(
-            hash_link.read_link().unwrap(),
-            Path::new(cert_link_0.file_name().unwrap())
         );
     }
 
